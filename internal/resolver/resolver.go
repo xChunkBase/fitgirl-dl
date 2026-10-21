@@ -91,6 +91,7 @@ func (r *Resolver) launch(ctx context.Context) (*session, error) {
 		Set("disable-blink-features", "AutomationControlled").
 		Set("enable-logging", "stderr").
 		Set("log-level", "3").
+		Env(browserEnv()...).
 		Logger(out)
 	if bin, ok := launcher.LookPath(); ok {
 		l = l.Bin(bin)
@@ -199,7 +200,7 @@ func (s *session) alive() bool {
 }
 
 func (r *Resolver) Resolve(ctx context.Context, link string) (string, error) {
-	limited := 0
+	retries := 0
 	delay := time.Until(r.last.Add(linkDelay))
 	for {
 		if err := sleep(ctx, delay); err != nil {
@@ -231,13 +232,13 @@ func (r *Resolver) Resolve(ctx context.Context, link string) (string, error) {
 				return "", err
 			}
 			delay = 0
-		case errors.Is(err, ErrRateLimited):
-			if limited == maxRetries {
-				return "", fmt.Errorf("%w: max retries reached", ErrRateLimited)
+		case errors.Is(err, ErrRateLimited), errors.Is(err, ErrChallenge):
+			if retries == maxRetries {
+				return "", fmt.Errorf("%w: max retries reached", err)
 			}
-			limited++
-			r.logf("Rate limited on %s. Retrying (%d/%d)...", link, limited, maxRetries)
-			delay = time.Duration(1<<limited)*time.Second + time.Duration(1000+rand.IntN(1000))*time.Millisecond
+			retries++
+			r.logf("%s: %v, retrying (%d/%d)", link, err, retries, maxRetries)
+			delay = time.Duration(1<<retries)*time.Second + time.Duration(1000+rand.IntN(1000))*time.Millisecond
 		default:
 			return "", err
 		}
@@ -422,6 +423,12 @@ func (o *output) fatal() string {
 		}
 	}
 	return ""
+}
+
+func browserEnv() []string {
+	return slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		return strings.HasPrefix(strings.ToUpper(kv), "__COMPAT_LAYER=")
+	})
 }
 
 func click(el *rod.Element) {
