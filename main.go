@@ -193,6 +193,9 @@ func resolveAll(ctx context.Context, line *status.Line, links []string, progress
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if errors.Is(err, resolver.ErrBrowserStopped) {
+			return err
+		}
 		if err != nil {
 			line.Error("%s  %s", name, line.Paint("could not be resolved: "+err.Error(), status.Red))
 			failed++

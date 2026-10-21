@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ import (
 
 const (
 	maxRetries       = 3
+	maxRestarts      = 2
 	attemptTimeout   = 2 * time.Minute
 	challengeTimeout = 30 * time.Second
 	settleDelay      = 1500 * time.Millisecond
@@ -30,22 +33,25 @@ const (
 	pollAttempts     = 25
 	linkDelay        = time.Second
 	closeTimeout     = 2 * time.Second
+	aliveTimeout     = 5 * time.Second
+	outputLimit      = 8 << 10
+	outputLineLimit  = 200
 )
 
 var (
-	ErrRateLimited = errors.New("rate limited")
-	ErrNotFound    = errors.New("download link not found")
-	ErrChallenge   = errors.New("blocked by cloudflare challenge")
+	ErrRateLimited    = errors.New("rate limited")
+	ErrNotFound       = errors.New("download link not found")
+	ErrChallenge      = errors.New("blocked by cloudflare challenge")
+	ErrBrowserStopped = errors.New("browser keeps stopping")
 
 	windowOpenPattern = regexp.MustCompile(`window\.open\(["'](https://[^"']*fuckingfast\.co/dl/[^"']+)["']`)
 	rateLimitKeywords = []string{"rate limited", "rate limit", "too many requests"}
 )
 
 type Resolver struct {
-	launcher *launcher.Launcher
-	browser  *rod.Browser
-	page     *rod.Page
 	logf     func(format string, args ...any)
+	session  *session
+	restarts int
 	last     time.Time
 	mu       sync.Mutex
 	found    string
@@ -53,37 +59,67 @@ type Resolver struct {
 	once     sync.Once
 }
 
+type session struct {
+	launcher *launcher.Launcher
+	browser  *rod.Browser
+	page     *rod.Page
+	output   *output
+}
+
+type output struct {
+	mu   sync.Mutex
+	data []byte
+}
+
 func New(ctx context.Context, logf func(format string, args ...any)) (*Resolver, error) {
+	r := &Resolver{logf: logf, returned: make(map[string]bool)}
+	s, err := r.launch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.session = s
+	return r, nil
+}
+
+func (r *Resolver) launch(ctx context.Context) (*session, error) {
+	out := &output{}
 	l := launcher.New().
 		Context(ctx).
 		HeadlessNew(true).
 		Leakless(runtime.GOOS != "windows").
 		Delete("enable-automation").
-		Set("disable-blink-features", "AutomationControlled")
+		Set("disable-blink-features", "AutomationControlled").
+		Set("enable-logging", "stderr").
+		Set("log-level", "3").
+		Logger(out)
 	if bin, ok := launcher.LookPath(); ok {
 		l = l.Bin(bin)
 	}
 
 	controlURL, err := l.Launch()
 	if err != nil {
+		_ = os.RemoveAll(l.Get(flags.UserDataDir))
 		return nil, fmt.Errorf("launch browser: %w", err)
 	}
 
-	r := &Resolver{launcher: l, logf: logf, returned: make(map[string]bool)}
-	r.browser = rod.New().ControlURL(controlURL).NoDefaultDevice()
-	if err := r.setup(); err != nil {
-		r.Close()
+	s := &session{
+		launcher: l,
+		browser:  rod.New().ControlURL(controlURL).NoDefaultDevice(),
+		output:   out,
+	}
+	if err := r.setup(s); err != nil {
+		s.close()
 		return nil, err
 	}
-	return r, nil
+	return s, nil
 }
 
-func (r *Resolver) setup() error {
-	if err := r.browser.Connect(); err != nil {
+func (r *Resolver) setup(s *session) error {
+	if err := s.browser.Connect(); err != nil {
 		return fmt.Errorf("connect browser: %w", err)
 	}
 
-	version, err := proto.BrowserGetVersion{}.Call(r.browser)
+	version, err := proto.BrowserGetVersion{}.Call(s.browser)
 	if err != nil {
 		return fmt.Errorf("browser version: %w", err)
 	}
@@ -91,17 +127,17 @@ func (r *Resolver) setup() error {
 	err = proto.BrowserSetDownloadBehavior{
 		Behavior:      proto.BrowserSetDownloadBehaviorBehaviorDeny,
 		EventsEnabled: true,
-	}.Call(r.browser)
+	}.Call(s.browser)
 	if err != nil {
 		return fmt.Errorf("download behavior: %w", err)
 	}
 
-	r.page, err = stealth.Page(r.browser)
+	s.page, err = stealth.Page(s.browser)
 	if err != nil {
 		return fmt.Errorf("open page: %w", err)
 	}
 
-	err = r.page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
+	err = s.page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
 		UserAgent:      strings.ReplaceAll(version.UserAgent, "HeadlessChrome", "Chrome"),
 		AcceptLanguage: "en-US,en;q=0.9",
 	})
@@ -109,30 +145,42 @@ func (r *Resolver) setup() error {
 		return fmt.Errorf("user agent: %w", err)
 	}
 
-	go r.page.EachEvent(r.onRequest, r.onResponse)()
-	go r.browser.EachEvent(r.onTargetCreated, r.onDownload)()
+	go s.page.EachEvent(r.onRequest, r.onResponse)()
+	go s.browser.EachEvent(func(e *proto.TargetTargetCreated) { r.onTargetCreated(s, e) }, r.onDownload)()
 	return nil
 }
 
 func (r *Resolver) Close() {
-	r.once.Do(func() {
-		if r.browser != nil {
-			_ = r.browser.Close()
-		}
-		if r.waitExit() {
-			return
-		}
-		r.launcher.Kill()
-		if !r.waitExit() {
-			_ = os.RemoveAll(r.launcher.Get(flags.UserDataDir))
-		}
-	})
+	r.once.Do(r.session.close)
 }
 
-func (r *Resolver) waitExit() bool {
+func (r *Resolver) restart(ctx context.Context) error {
+	r.session.close()
+	s, err := r.launch(ctx)
+	if err != nil {
+		return err
+	}
+	r.session = s
+	return nil
+}
+
+func (s *session) close() {
+	if s.browser != nil {
+		_ = s.browser.Close()
+	}
+	if s.waitExit() {
+		return
+	}
+	s.launcher.Kill()
+	if !s.waitExit() {
+		_ = os.RemoveAll(s.launcher.Get(flags.UserDataDir))
+	}
+}
+
+func (s *session) waitExit() bool {
 	done := make(chan struct{})
 	go func() {
-		r.launcher.Cleanup()
+		s.launcher.Cleanup()
 		close(done)
 	}()
 	select {
@@ -143,30 +191,56 @@ func (r *Resolver) waitExit() bool {
 	}
 }
 
+func (s *session) alive() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), aliveTimeout)
+	defer cancel()
+	_, err := s.page.Context(ctx).Eval(`() => true`)
+	return err == nil
+}
+
 func (r *Resolver) Resolve(ctx context.Context, link string) (string, error) {
-	for attempt := 0; ; attempt++ {
-		delay := time.Until(r.last.Add(linkDelay))
-		if attempt > 0 {
-			delay = time.Duration(1<<attempt)*time.Second + time.Duration(1000+rand.IntN(1000))*time.Millisecond
-		}
+	limited := 0
+	delay := time.Until(r.last.Add(linkDelay))
+	for {
 		if err := sleep(ctx, delay); err != nil {
 			return "", err
 		}
 
 		direct, err := r.resolve(ctx, link)
 		r.last = time.Now()
-		if err == nil {
+		switch {
+		case err == nil:
+			r.restarts = 0
 			r.mu.Lock()
 			r.returned[direct] = true
 			r.mu.Unlock()
+			return direct, nil
+		case ctx.Err() != nil:
+			return "", ctx.Err()
+		case !r.session.alive():
+			detail := ""
+			if line := r.session.output.fatal(); line != "" {
+				detail = fmt.Sprintf(" (Chrome: %s)", line)
+			}
+			if r.restarts == maxRestarts {
+				return "", fmt.Errorf("%w after %d restarts%s: %v", ErrBrowserStopped, maxRestarts, detail, err)
+			}
+			r.restarts++
+			r.logf("Browser stopped unexpectedly%s, restarting it (%d/%d)", detail, r.restarts, maxRestarts)
+			if err := r.restart(ctx); err != nil {
+				return "", err
+			}
+			delay = 0
+		case errors.Is(err, ErrRateLimited):
+			if limited == maxRetries {
+				return "", fmt.Errorf("%w: max retries reached", ErrRateLimited)
+			}
+			limited++
+			r.logf("Rate limited on %s. Retrying (%d/%d)...", link, limited, maxRetries)
+			delay = time.Duration(1<<limited)*time.Second + time.Duration(1000+rand.IntN(1000))*time.Millisecond
+		default:
+			return "", err
 		}
-		if !errors.Is(err, ErrRateLimited) {
-			return direct, err
-		}
-		if attempt == maxRetries {
-			return "", fmt.Errorf("%w: max retries reached", ErrRateLimited)
-		}
-		r.logf("Rate limited on %s. Retrying (%d/%d)...", link, attempt+1, maxRetries)
 	}
 }
 
@@ -174,7 +248,7 @@ func (r *Resolver) resolve(ctx context.Context, link string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, attemptTimeout)
 	defer cancel()
 
-	page := r.page.Context(ctx)
+	page := r.session.page.Context(ctx)
 	r.setFound("")
 
 	target, _, _ := strings.Cut(link, "#")
@@ -271,14 +345,14 @@ func (r *Resolver) onResponse(e *proto.NetworkResponseReceived) {
 	}
 }
 
-func (r *Resolver) onTargetCreated(e *proto.TargetTargetCreated) {
+func (r *Resolver) onTargetCreated(s *session, e *proto.TargetTargetCreated) {
 	info := e.TargetInfo
-	if info.Type != proto.TargetTargetInfoTypePage || info.OpenerID != r.page.TargetID {
+	if info.Type != proto.TargetTargetInfoTypePage || info.OpenerID != s.page.TargetID {
 		return
 	}
 	r.record(info.URL, "")
 	go func() {
-		_, _ = proto.TargetCloseTarget{TargetID: info.TargetID}.Call(r.browser)
+		_, _ = proto.TargetCloseTarget{TargetID: info.TargetID}.Call(s.browser)
 	}()
 }
 
@@ -323,6 +397,31 @@ func (r *Resolver) result() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.found
+}
+
+func (o *output) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.data = append(o.data, p...)
+	if len(o.data) > outputLimit {
+		o.data = o.data[len(o.data)-outputLimit:]
+	}
+	return len(p), nil
+}
+
+func (o *output) fatal() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, raw := range slices.Backward(bytes.Split(o.data, []byte("\n"))) {
+		line := strings.TrimSpace(string(raw))
+		if strings.Contains(line, ":FATAL:") {
+			if len(line) > outputLineLimit {
+				line = line[:outputLineLimit] + "..."
+			}
+			return line
+		}
+	}
+	return ""
 }
 
 func click(el *rod.Element) {
