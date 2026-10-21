@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,7 @@ func New(ctx context.Context, logf func(format string, args ...any)) (*Resolver,
 	l := launcher.New().
 		Context(ctx).
 		HeadlessNew(true).
+		Leakless(runtime.GOOS != "windows").
 		Delete("enable-automation").
 		Set("disable-blink-features", "AutomationControlled")
 	if bin, ok := launcher.LookPath(); ok {
